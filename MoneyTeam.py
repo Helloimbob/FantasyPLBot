@@ -7,27 +7,46 @@ from datetime import datetime
 
 import aiohttp
 from fpl import FPL
-import fpl
+from fpl import user
 from constants import NEXT_GAMEWEEK
+from constants import PREV_GAMEWEEK
 from constants import FIXTURE_DIFFICULTY_SCALE
+from constants import BOT_ID
 from fpl.utils import position_converter
 from fpl.utils import team_converter
 
 def calc_roi(points, cost):
     return points / cost
 
-def print_team(team):
+def print_team(team, captain=True):
     for index, player in enumerate(team):
-        if index == 0:
+        if captain and index == 0:
             print(f"{player.web_name} (C) - "
                 f"{position_converter(player.element_type)} - "
                 f"{team_converter(player.team)}")
-        elif index == 1:
+        elif captain and index == 1:
             print(f"{player.web_name} (VC) - "
                 f"{position_converter(player.element_type)} - "
                 f"{team_converter(player.team)}")
         else:
             print(player)
+
+def sort_by_roi(playerList, ascending=True):
+    roiPlayers = []
+    for player in playerList:
+        # Assign their calculated ROI
+        setattr(player, 'roi', calc_roi(
+            player.total_points, player.now_cost))
+        roiPlayers.append(player)
+    # sort by ROI
+    roiPlayers.sort(key=lambda x: x.roi, reverse=ascending)
+    return roiPlayers
+
+def is_in_team(player, team):
+    for currPlayer in team:
+        if player.id == currPlayer.id:
+            return True
+    return False
 
 class TeamSelector:
 
@@ -42,16 +61,16 @@ class TeamSelector:
         self.teamCount = dict()
         for x in range(1, 21):
             self.teamCount[x] = 0
-        self.injured = []
+        self.unvailable = []
 
     async def cache_data(self):
         self.players = await self.fpl.get_players()
         self.fixtures = await self.fpl.get_fixtures_by_gameweek(NEXT_GAMEWEEK)
 
-    def get_injured_players(self):
+    def get_unavailable_players(self):
         for player in self.players:
-            if player.status == 'i':
-                self.injured.append(player)
+            if player.status == 'i' or player.status == 'n':
+                self.unvailable.append(player)
 
     def points_top_players(self, position):
         positionPlayers = []
@@ -75,9 +94,9 @@ class TeamSelector:
         return positionPlayers
 
     def player_allowed(self, player):
-        if not self.injured:
-            self.get_injured_players()
-        if player not in self.injured and self.budget >= player.now_cost and self.positions[player.element_type] > 0 and self.teamCount[player.team] < 3:
+        if not self.unvailable:
+            self.get_unavailable_players()
+        if player not in self.unvailable and self.budget >= player.now_cost and self.positions[player.element_type] > 0 and self.teamCount[player.team] < 3:
             return True
         else:
             return False
@@ -126,14 +145,71 @@ class TeamSelector:
             setattr(player, 'adj_points', player.total_points * FIXTURE_DIFFICULTY_SCALE[diff])
         currentTeam.sort(key=lambda x: x.adj_points, reverse=True)
 
+    async def pick_transfer(self, currentTeam, freeTransfers):
+        # For each transfer
+        transfersOut = []
+        transferBudget = 3
+        transferPositions = {1: 0, 2 : 0, 3 : 0, 4 : 0}
+
+        sortedTeam = sort_by_roi(currentTeam, False)
+
+        for player in sortedTeam:
+            if (player not in transfersOut):
+                transfersOut.append(player)
+                transferPositions[player.element_type] += 1
+                transferBudget += player.selling_price
+                if (len(transfersOut) == freeTransfers):
+                    break
+        
+        # First transfer out any unavailable players
+        # then transfer out the worst performing player
+        makeTransfers = []
+        for position in transferPositions.keys():
+            for player in self.roi_top_players(position, self.premium_limit[position]):
+                if player not in self.unvailable and not is_in_team(player, currentTeam) and transferBudget >= player.now_cost and transferPositions[player.element_type] > 0:
+                    makeTransfers.append(player)
+                    transferBudget -= player.now_cost
+                    transferPositions[player.element_type] = transferPositions[player.element_type] - 1
+        
+        print ('Out: ')
+        print_team(transfersOut, False)
+        print ('In: ')
+        print_team(makeTransfers, False)
+        print ('')
+        # next find out 
+        return makeTransfers
+
+    async def get_current_team(self):
+        user = await self.fpl.get_user(BOT_ID)
+        await self.fpl.login()
+        picks = await user.get_team()
+
+        currentTeamIds = []
+        currentTeam = []
+
+        for player in picks:
+            currentTeamIds.append(player.get('element'))
+
+        currentTeam = await self.fpl.get_players(currentTeamIds)
+        for player in currentTeam:
+            for pick in picks:
+                if (player.id == pick.get('element')):
+                    setattr(player, 'selling_price', pick.get('selling_price'))
+                    break
+
+        return currentTeam
 
 async def main():
     async with aiohttp.ClientSession() as session:
         teamSelector = TeamSelector(session)
         await teamSelector.cache_data()
-        money_team = teamSelector.get_money_team_objects()
-        teamSelector.sort_by_adjusted_points(money_team)
-        print_team(money_team)
+        # money_team = teamSelector.get_money_team_objects()
+        # teamSelector.sort_by_adjusted_points(money_team)
+        # print_team(money_team)
+        curr = await teamSelector.get_current_team()
+        await teamSelector.pick_transfer(curr, 1)
+        teamSelector.sort_by_adjusted_points(curr)
+        print_team(curr)
 
 if __name__ == "__main__":
     try:
